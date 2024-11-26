@@ -1,0 +1,14 @@
+[Unit]
+Description=Python service for exporting temp_c metrics to Prometheus
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=root
+ExecStart=/usr/bin/python3 /opt/prometheus-exporter.py
+
+[Install]
+WantedBy=multi-user.target

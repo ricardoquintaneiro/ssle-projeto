@@ -1,0 +1,62 @@
+groups:
+  - name: HealthAlerts
+    rules:
+      - alert: ServiceUnhealthy
+        expr: service_health == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Service {{ $labels.service }} is unhealthy (status: {{ $labels.status }})"
+          description: |
+            The service at {{ $labels.service }} is reachable but returned a non-200 status code (status: {{ $labels.status }}).
+
+      - alert: ServiceUnreachable
+        expr: service_availability == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.service }} is unreachable"
+          description: |
+            The service at {{ $labels.service }} is completely unreachable (no response).
+
+  - name: PerformanceAlerts
+    rules:
+      - alert: HighResponseTime
+        expr: avg_over_time(service_response_time_seconds[1m]) > 0.5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High response time for {{ $labels.service }}"
+          description: |
+            The service at {{ $labels.service }} has a high average response time
+            ({{ $value }} seconds) over the past minute. This may indicate performance issues
+            or a potential DDoS attack.
+
+  - name: ScrapeFailureAlerts
+    rules:
+      - alert: ScrapeFailure
+        expr: up{job="your_job_name", instance="your_service_instance"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus failed to scrape {{ $labels.instance }}"
+          description: |
+            Prometheus has failed to scrape metrics from the service at {{ $labels.instance }} for the last 2 minutes. This could be due to a service outage, high load, or DDoS attack.
+
+  - name: ScrapeDurationAlerts
+    rules:
+      - alert: HighScrapeDuration
+        expr: scrape_duration_seconds > 0.2
+        for: 10s
+        labels:
+          severity: warning
+        annotations:
+          summary: "High scrape duration for {{ $labels.instance }}"
+          description: |
+            Scrape duration for {{ $labels.instance }} in job {{ $labels.job }}
+            is unusually high ({{ $value }} seconds). This may indicate overload
+            or potential DDoS activity.
