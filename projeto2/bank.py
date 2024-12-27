@@ -1,7 +1,8 @@
-import sys
-import threading
-import socket
+import argparse
 import json
+import socket
+import threading
+
 import requests
 from flask import Flask, request
 from flask_restful import Api, Resource
@@ -79,8 +80,9 @@ def majority_approved(responses, status_key="status", success_value="accepted"):
 def handle_prepare(message):
     global proposal_id, accepted_proposal
     incoming_proposal_id = message["proposal_id"]
+    incoming_node_id = message["node_id"]
 
-    if incoming_proposal_id > proposal_id or (incoming_proposal_id == proposal_id and message["node_id"] < bank_id):
+    if incoming_proposal_id > proposal_id or (incoming_proposal_id == proposal_id and incoming_node_id <= bank_id):
         proposal_id = incoming_proposal_id
         return {"status": "promise", "last_accepted": accepted_proposal}
     return {"status": "reject"}
@@ -138,7 +140,6 @@ def consume_paxos_messages():
                 client_socket.sendall(json.dumps(response).encode('utf-8'))
 
 
-threading.Thread(target=consume_paxos_messages, daemon=True).start()
 
 class Bank(Resource):
 
@@ -217,12 +218,16 @@ api.add_resource(Bank, "/update", endpoint="update", methods=["PATCH"])
 
 if __name__ == "__main__":
     # Get continent from user arguments
-    if len(sys.argv) < 2:
-        print("Usage: python bank.py <continent>")
-        sys.exit(1)
-    continent = str(sys.argv[1])
+    parser = argparse.ArgumentParser(description="Run a bank service.")
+    parser.add_argument("continent", type=str, help="Continent where the bank is located")
+    args = parser.parse_args()
+    continent = args.continent
     bank_id = bank_ids.get(continent)
+
     PORT = 5000 + bank_id
     PAXOS_PORT = 6000 + bank_id
+
+    threading.Thread(target=consume_paxos_messages, daemon=True).start()
+
     register_service()
     app.run(port=PORT)
