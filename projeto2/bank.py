@@ -1,3 +1,4 @@
+import asyncio
 import argparse
 import json
 import socket
@@ -45,29 +46,35 @@ def get_services() -> list:
         return []
 
 
-def send_paxos_message(phase, message) -> list:
+async def contact_service(service, payload, responses):
+    target_port = 6000 + service["id"]
+    try:
+        reader, writer = await asyncio.open_connection('127.0.0.1', target_port)
+        writer.write(json.dumps(payload).encode('utf-8'))
+        await writer.drain()
+
+        # Set a timeout for reading the response
+        data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+        response = data.decode('utf-8')
+        if not response.strip():
+            raise ValueError(f"Empty response from {service['name']} on port {target_port}")
+        print(f"Response from {service['name']} (port {target_port}): {response}")
+        responses.append(json.loads(response))
+    except (ConnectionError, ValueError, asyncio.TimeoutError) as e:
+        print(f"Error communicating with {service['name']} on port {target_port}: {e}")
+        responses.append({"status": "error", "message": str(e)})
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def send_paxos_message(phase, message) -> list:
     payload = {"phase": phase, "data": message}
     services = get_services()
     responses = []
 
-    for service in services:
-        try:
-            target_port = 6000 + service["id"]
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect(('127.0.0.1', target_port))
-                s.sendall(json.dumps(payload).encode('utf-8'))
-
-                # Read the response (with timeout to avoid hanging indefinitely)
-                s.settimeout(5.0)
-                response = s.recv(1024).decode('utf-8')
-                if not response.strip():  # Handle empty response
-                    raise ValueError(f"Empty response from {service['name']} on port {target_port}")
-                
-                print(f"Response from {service['name']} (port {target_port}): {response}")
-                responses.append(json.loads(response))  # Try to parse JSON
-        except (ConnectionError, ValueError, json.JSONDecodeError) as e:
-            print(f"Error communicating with {service['name']} on port {target_port}: {e}")
-            responses.append({"status": "error", "message": str(e)})
+    tasks = [contact_service(service, payload, responses) for service in services]
+    await asyncio.gather(*tasks)
 
     return responses
 
@@ -193,17 +200,17 @@ class Bank(Resource):
         proposal_id += 1
 
         # Paxos Phase 1: Prepare
-        prepare_responses = send_paxos_message("prepare", {"proposal_id": proposal_id, "node_id": bank_id, "account_balances": new_account_balances})
+        prepare_responses = asyncio.run(send_paxos_message("prepare", {"proposal_id": proposal_id, "node_id": bank_id, "account_balances": new_account_balances}))
         if not majority_approved(prepare_responses, "status", "promise"):
             return {"message": "Operation rejected during prepare phase"}, 400
 
         # Paxos Phase 2: Accept
-        accept_responses = send_paxos_message("accept", {"proposal_id": proposal_id, "node_id": bank_id, "account_balances": new_account_balances})
+        accept_responses = asyncio.run(send_paxos_message("accept", {"proposal_id": proposal_id, "node_id": bank_id, "account_balances": new_account_balances}))
         if not majority_approved(accept_responses):
             return {"message": "Operation rejected during accept phase"}, 400
 
         # Paxos Phase 3: Learn
-        learn_responses = send_paxos_message("learn", {"proposal_id": proposal_id, "node_id": bank_id, "account_balances": new_account_balances})
+        learn_responses = asyncio.run(send_paxos_message("learn", {"proposal_id": proposal_id, "node_id": bank_id, "account_balances": new_account_balances}))
         if not majority_approved(learn_responses, "status", "success"):
             return {"message": "Operation rejected during learn phase"}, 400
 
