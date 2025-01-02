@@ -1,13 +1,17 @@
-import asyncio
 import argparse
+import asyncio
+import hashlib
+import hmac
 import json
 import socket
 import threading
+from threading import Lock
 
 import requests
 from flask import Flask, request
 from flask_restful import Api, Resource
-from threading import Lock
+
+SECRET_KEY = b"SSLE_24_25"
 
 app = Flask(__name__)
 api = Api(app)
@@ -22,6 +26,14 @@ proposal_id = 0
 accepted_proposal = None
 learned_proposals = {}
 last_learned_proposal = 0
+
+def sign_message(message: str) -> str:
+    serialized_message = json.dumps(message, sort_keys=True).encode('utf-8')
+    return hmac.new(SECRET_KEY, serialized_message, hashlib.sha384).hexdigest()
+
+def verify_message(message: str, signature: str):
+    expected_signature = sign_message(message)
+    return hmac.compare_digest(expected_signature, signature)
 
 def register_service() -> None:
     payload = {"id": bank_id, "name": f"Bank of {continent}", "url": f"http://127.0.0.1:{PORT}/"}
@@ -62,8 +74,12 @@ async def contact_service(service, payload, responses):
             response = data.decode('utf-8')
             if not response.strip():
                 raise ValueError(f"Empty response from {service['name']} on port {target_port}")
+            response = json.loads(response)
+            signature = response.pop("signature", "")
+            if not verify_message(response, signature):
+                raise ValueError(f"Invalid signature from {service['name']} on port {target_port}")
             print(f"Response from {service['name']} (port {target_port}): {response}")
-            responses.append(json.loads(response))
+            responses.append(response)
     except (ConnectionError, ValueError, asyncio.TimeoutError, Exception) as e:
         print(f"Error communicating with {service['name']} on port {target_port}: {e}")
         responses.append({"status": "error", "message": str(e)})
@@ -76,6 +92,7 @@ async def contact_service(service, payload, responses):
 
 async def send_paxos_message(phase, message) -> list:
     payload = {"phase": phase, "data": message}
+    payload["signature"] = sign_message(payload)
     services = get_services()
     responses = []
 
@@ -106,7 +123,6 @@ def handle_prepare(message):
 def handle_accept(message):
     global proposal_id, accepted_proposal
     incoming_proposal_id = message["proposal_id"]
-    incoming_node_id = message["node_id"]
     proposed_account_balances = message["account_balances"]
 
     if incoming_proposal_id == proposal_id:
@@ -150,25 +166,33 @@ def consume_paxos_messages():
             with client_socket:
                 try:
                     message = json.loads(client_socket.recv(1024).decode('utf-8'))
+                    signature = message.pop("signature", "")
+                    if not signature:
+                        raise ValueError("Missing signature")
+
                     phase = message.get("phase")
                     data = message.get("data")
 
-                    response = None
-
-                    if phase == "prepare":
-                        response = handle_prepare(data)
-                    elif phase == "accept":
-                        handle_accept(data)
-                    elif phase == "learn":
-                        handle_learn(data)
+                    if not verify_message(message, signature):
+                        response = {"status": "error", "message": "Invalid signature"}
                     else:
-                        response = {"status": "error", "message": "Invalid phase"}
+                        response = None
+
+                        if phase == "prepare":
+                            response = handle_prepare(data)
+                        elif phase == "accept":
+                            handle_accept(data)
+                        elif phase == "learn":
+                            handle_learn(data)
+                        else:
+                            response = {"status": "error", "message": "Invalid phase"}
                 except json.JSONDecodeError:
                     response = {"status": "error", "message": "Invalid JSON in request"}
                 except Exception as e:
                     response = {"status": "error", "message": str(e)}
                 
                 if response:
+                    response["signature"] = sign_message(response)
                     client_socket.sendall(json.dumps(response).encode('utf-8'))
 
 async def wait_for_majority_learn(proposal_id):
