@@ -7,6 +7,7 @@ import threading
 import requests
 from flask import Flask, request
 from flask_restful import Api, Resource
+from threading import Lock
 
 app = Flask(__name__)
 api = Api(app)
@@ -19,6 +20,8 @@ total_money = sum(account_balances.values())
 SERVICE_REGISTRY_URL = "http://127.0.0.1:5000/services"
 proposal_id = 0
 accepted_proposal = None
+learned_proposals = {}
+last_learned_proposal = 0
 
 def register_service() -> None:
     payload = {"id": bank_id, "name": f"Bank of {continent}", "url": f"http://127.0.0.1:{PORT}/"}
@@ -53,19 +56,22 @@ async def contact_service(service, payload, responses):
         writer.write(json.dumps(payload).encode('utf-8'))
         await writer.drain()
 
-        # Set a timeout for reading the response
-        data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
-        response = data.decode('utf-8')
-        if not response.strip():
-            raise ValueError(f"Empty response from {service['name']} on port {target_port}")
-        print(f"Response from {service['name']} (port {target_port}): {response}")
-        responses.append(json.loads(response))
-    except (ConnectionError, ValueError, asyncio.TimeoutError) as e:
+        if payload["phase"] == "prepare":
+            # Set a timeout for reading the response
+            data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
+            response = data.decode('utf-8')
+            if not response.strip():
+                raise ValueError(f"Empty response from {service['name']} on port {target_port}")
+            print(f"Response from {service['name']} (port {target_port}): {response}")
+            responses.append(json.loads(response))
+    except (ConnectionError, ValueError, asyncio.TimeoutError, Exception) as e:
         print(f"Error communicating with {service['name']} on port {target_port}: {e}")
         responses.append({"status": "error", "message": str(e)})
     finally:
-        writer.close()
-        await writer.wait_closed()
+        if 'writer' in locals():
+            writer.close()
+            await writer.wait_closed()
+
 
 
 async def send_paxos_message(phase, message) -> list:
@@ -73,7 +79,7 @@ async def send_paxos_message(phase, message) -> list:
     services = get_services()
     responses = []
 
-    tasks = [contact_service(service, payload, responses) for service in services]
+    tasks = [contact_service(service, payload, responses) for service in services if service["id"] != bank_id or phase == "learn"]
     await asyncio.gather(*tasks)
 
     return responses
@@ -82,39 +88,56 @@ async def send_paxos_message(phase, message) -> list:
 def majority_approved(responses, status_key="status", success_value="accepted"):
     # Check if the majority of responses are successful
     successful = sum(1 for response in responses if response.get(status_key) == success_value)
-    return successful > len(responses) // 2
+    return successful >= (len(get_services()) - 1) // 2
 
 def handle_prepare(message):
     global proposal_id, accepted_proposal
-    incoming_proposal_id = message["proposal_id"]
-    incoming_node_id = message["node_id"]
+    incoming_proposal_id = message.get("proposal_id", None)
 
-    if incoming_proposal_id > proposal_id or (incoming_proposal_id == proposal_id and incoming_node_id <= bank_id):
+    if incoming_proposal_id is None:
+        return {"status": "error", "message": "'proposal_id' missing in message"}
+
+    if incoming_proposal_id > proposal_id:
         proposal_id = incoming_proposal_id
         return {"status": "promise", "last_accepted": accepted_proposal}
     return {"status": "reject"}
 
+
 def handle_accept(message):
     global proposal_id, accepted_proposal
     incoming_proposal_id = message["proposal_id"]
+    incoming_node_id = message["node_id"]
     proposed_account_balances = message["account_balances"]
 
     if incoming_proposal_id == proposal_id:
         accepted_proposal = proposed_account_balances
-        return {"status": "accepted"}
-    return {"status": "reject"}
+
+        broadcast_message = {
+            "proposal_id": proposal_id,
+            "account_balances": proposed_account_balances
+        }
+        asyncio.run(send_paxos_message("learn", broadcast_message))
+
+
+learned_proposals_lock = Lock()
 
 def handle_learn(message):
-    global account_balances
-    account_balances.update(message["account_balances"])
+    global account_balances, learned_proposals, last_learned_proposal
 
-    return {"status": "success", "balances": account_balances}
+    proposal_id = message["proposal_id"]
+    proposed_balances = message["account_balances"]
 
-def validate_total_money():
-    global account_balances, total_money
-    current_total = sum(account_balances.values())
-    if current_total != total_money:
-        raise ValueError(f"Inconsistent total money! Expected {total_money}, found {current_total}.")
+    with learned_proposals_lock:
+        if proposal_id not in learned_proposals:
+            learned_proposals[proposal_id] = 0
+
+        learned_proposals[proposal_id] += 1
+
+        if learned_proposals[proposal_id] == ((len(get_services()) - 1) // 2) + 1:
+            account_balances.update(proposed_balances)
+            del learned_proposals[proposal_id]
+            last_learned_proposal = proposal_id
+
 
 def consume_paxos_messages():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
@@ -130,22 +153,37 @@ def consume_paxos_messages():
                     phase = message.get("phase")
                     data = message.get("data")
 
+                    response = None
+
                     if phase == "prepare":
                         response = handle_prepare(data)
                     elif phase == "accept":
-                        response = handle_accept(data)
+                        handle_accept(data)
                     elif phase == "learn":
-                        response = handle_learn(data)
+                        handle_learn(data)
                     else:
                         response = {"status": "error", "message": "Invalid phase"}
                 except json.JSONDecodeError:
                     response = {"status": "error", "message": "Invalid JSON in request"}
                 except Exception as e:
                     response = {"status": "error", "message": str(e)}
+                
+                if response:
+                    client_socket.sendall(json.dumps(response).encode('utf-8'))
 
-                # Ensure a response is sent back to the client
-                client_socket.sendall(json.dumps(response).encode('utf-8'))
+async def wait_for_majority_learn(proposal_id):
+    global learned_proposals, last_learned_proposal
 
+    timeout = 10  # Adjust as needed
+    start_time = asyncio.get_event_loop().time()
+
+    while asyncio.get_event_loop().time() - start_time < timeout:
+        with learned_proposals_lock:
+            if proposal_id == last_learned_proposal:
+                return True
+        await asyncio.sleep(0.1)
+
+    return False
 
 
 class Bank(Resource):
@@ -205,17 +243,14 @@ class Bank(Resource):
             return {"message": "Operation rejected during prepare phase"}, 400
 
         # Paxos Phase 2: Accept
-        accept_responses = asyncio.run(send_paxos_message("accept", {"proposal_id": proposal_id, "node_id": bank_id, "account_balances": new_account_balances}))
-        if not majority_approved(accept_responses):
-            return {"message": "Operation rejected during accept phase"}, 400
+        asyncio.run(send_paxos_message("accept", {"proposal_id": proposal_id, "node_id": bank_id, "account_balances": new_account_balances}))
 
-        # Paxos Phase 3: Learn
-        learn_responses = asyncio.run(send_paxos_message("learn", {"proposal_id": proposal_id, "node_id": bank_id, "account_balances": new_account_balances}))
-        if not majority_approved(learn_responses, "status", "success"):
-            return {"message": "Operation rejected during learn phase"}, 400
+        # Wait until learning phase completes
+        learning_completed = asyncio.run(wait_for_majority_learn(proposal_id))
 
-        # Update global balances after consensus
-        account_balances.update(new_account_balances)
+        if not learning_completed:
+            return {"message": "Operation timed out during learning phase"}, 408
+
         return {"message": f"{action.capitalize()} successful", "balances": account_balances}, 200
 
 
