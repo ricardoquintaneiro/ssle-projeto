@@ -68,7 +68,7 @@ async def contact_service(service, payload, responses):
         writer.write(json.dumps(payload).encode('utf-8'))
         await writer.drain()
 
-        if payload["phase"] == "prepare":
+        if payload["phase"] in ["prepare", "verify"]:
             # Set a timeout for reading the response
             data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
             response = data.decode('utf-8')
@@ -95,8 +95,16 @@ async def send_paxos_message(phase, message) -> list:
     payload["signature"] = sign_message(payload)
     services = get_services()
     responses = []
+    node_id = message["node_id"]
 
-    tasks = [contact_service(service, payload, responses) for service in services if service["id"] != bank_id or phase == "learn"]
+    if phase == "verify":
+        targets = [service for service in services if service["id"] != node_id]
+    elif phase == "learn":
+        targets = services
+    else:
+        targets = [service for service in services if service["id"] != bank_id]
+
+    tasks = [contact_service(service, payload, responses) for service in targets]
     await asyncio.gather(*tasks)
 
     return responses
@@ -106,6 +114,7 @@ def majority_approved(responses, status_key="status", success_value="accepted"):
     # Check if the majority of responses are successful
     successful = sum(1 for response in responses if response.get(status_key) == success_value)
     return successful >= (len(get_services()) - 1) // 2
+
 
 def handle_prepare(message):
     global proposal_id, accepted_proposal
@@ -123,16 +132,53 @@ def handle_prepare(message):
 def handle_accept(message):
     global proposal_id, accepted_proposal
     incoming_proposal_id = message["proposal_id"]
+    incoming_node_id = message["node_id"]
     proposed_account_balances = message["account_balances"]
 
     if incoming_proposal_id == proposal_id:
         accepted_proposal = proposed_account_balances
 
+        # Broadcast verify message asynchronously
         broadcast_message = {
             "proposal_id": proposal_id,
+            "node_id": incoming_node_id,
             "account_balances": proposed_account_balances
         }
-        asyncio.run(send_paxos_message("learn", broadcast_message))
+        print("Broadcasting verify message:", broadcast_message)
+
+        # Dispatch the verify phase as a background task
+        asyncio.create_task(verify_and_learn(broadcast_message))
+    else:
+        print(f"Rejected proposal {incoming_proposal_id} (current: {proposal_id})")
+
+
+async def verify_and_learn(broadcast_message):
+    # Verify phase
+    verification_responses = await send_paxos_message("verify", broadcast_message)
+    print("Responses:", verification_responses)
+
+    if not majority_approved(verification_responses, "status", "verified"):
+        print(f"Verification failed for proposal {broadcast_message['proposal_id']}. Aborting Paxos.")
+        return
+
+    # If majority verified, proceed to learn phase
+    await send_paxos_message("learn", broadcast_message)
+    print(f"Proposal {broadcast_message['proposal_id']} learned successfully.")
+
+
+
+
+def handle_verify(message):
+    global proposal_id, accepted_proposal
+
+    incoming_proposal_id = message["proposal_id"]
+    proposed_account_balances = message["account_balances"]
+
+    # Check proposal ID and balances
+    if incoming_proposal_id == proposal_id and proposed_account_balances == accepted_proposal:
+        return {"status": "verified"}
+    return {"status": "error", "message": "Mismatch in proposal or balances"}
+
 
 
 learned_proposals_lock = Lock()
@@ -149,51 +195,59 @@ def handle_learn(message):
 
         learned_proposals[proposal_id] += 1
 
-        if learned_proposals[proposal_id] == ((len(get_services()) - 1) // 2) + 1:
+        if last_learned_proposal != proposal_id and learned_proposals[proposal_id] == ((len(get_services()) - 1) // 2) + 1:
             account_balances.update(proposed_balances)
             del learned_proposals[proposal_id]
             last_learned_proposal = proposal_id
 
 
-def consume_paxos_messages():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-        server_socket.bind(('127.0.0.1', PAXOS_PORT))
-        server_socket.listen(5)
-        print(f"Paxos server listening on port {PAXOS_PORT}...")
+async def process_message(client_socket, address):
+    try:
+        message = json.loads(await asyncio.to_thread(client_socket.recv, 1024))
+        signature = message.pop("signature", "")
+        if not signature:
+            raise ValueError("Missing signature")
 
-        while True:
-            client_socket, _ = server_socket.accept()
-            with client_socket:
-                try:
-                    message = json.loads(client_socket.recv(1024).decode('utf-8'))
-                    signature = message.pop("signature", "")
-                    if not signature:
-                        raise ValueError("Missing signature")
+        phase = message.get("phase")
+        data = message.get("data")
 
-                    phase = message.get("phase")
-                    data = message.get("data")
+        if not verify_message(message, signature):
+            response = {"status": "error", "message": "Invalid signature"}
+        else:
+            response = None
 
-                    if not verify_message(message, signature):
-                        response = {"status": "error", "message": "Invalid signature"}
-                    else:
-                        response = None
+            if phase == "prepare":
+                response = handle_prepare(data)
+            elif phase == "accept":
+                handle_accept(data)
+            elif phase == "verify":
+                print("Handling verify message")
+                response = handle_verify(data)
+            elif phase == "learn":
+                handle_learn(data)
+            else:
+                response = {"status": "error", "message": "Invalid phase"}
 
-                        if phase == "prepare":
-                            response = handle_prepare(data)
-                        elif phase == "accept":
-                            handle_accept(data)
-                        elif phase == "learn":
-                            handle_learn(data)
-                        else:
-                            response = {"status": "error", "message": "Invalid phase"}
-                except json.JSONDecodeError:
-                    response = {"status": "error", "message": "Invalid JSON in request"}
-                except Exception as e:
-                    response = {"status": "error", "message": str(e)}
-                
-                if response:
-                    response["signature"] = sign_message(response)
-                    client_socket.sendall(json.dumps(response).encode('utf-8'))
+        if response:
+            response["signature"] = sign_message(response)
+            await asyncio.to_thread(client_socket.sendall, json.dumps(response).encode('utf-8'))
+    except Exception as e:
+        print(f"Error processing message from {address}: {e}")
+    finally:
+        client_socket.close()
+
+
+async def consume_paxos_messages():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(('127.0.0.1', PAXOS_PORT))
+    server_socket.listen(5)
+    print(f"Paxos server listening on port {PAXOS_PORT}...")
+
+    while True:
+        client_socket, address = await asyncio.to_thread(server_socket.accept)
+        asyncio.create_task(process_message(client_socket, address))
+
 
 async def wait_for_majority_learn(proposal_id):
     global learned_proposals, last_learned_proposal
@@ -278,6 +332,8 @@ class Bank(Resource):
         return {"message": f"{action.capitalize()} successful", "balances": account_balances}, 200
 
 
+def start_paxos_server():
+    asyncio.run(consume_paxos_messages())
 
 api.add_resource(Bank, "/balance", endpoint="balance", methods=["GET"])
 api.add_resource(Bank, "/update", endpoint="update", methods=["PATCH"])
@@ -293,7 +349,7 @@ if __name__ == "__main__":
     PORT = 5000 + bank_id
     PAXOS_PORT = 6000 + bank_id
 
-    threading.Thread(target=consume_paxos_messages, daemon=True).start()
+    threading.Thread(target=start_paxos_server, daemon=True).start()
 
     register_service()
     app.run(port=PORT)
