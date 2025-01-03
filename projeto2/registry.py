@@ -3,7 +3,7 @@ from cryptography.hazmat.primitives.asymmetric import ed448
 from flask import Flask, request
 from flask_restful import Api, Resource
 
-from bank import verify_message
+from bank import verify_message_hmac
 
 app = Flask(__name__)
 api = Api(app)
@@ -40,7 +40,7 @@ class Services(Resource):
             return {"error": "Missing signature."}, 400
         if not isinstance(signature, str):
             return {"error": "Invalid signature format."}, 400
-        if not verify_message(str(request.json), signature):
+        if not verify_message_hmac(str(request.json), signature):
             return {"error": "Invalid signature."}, 400
         service_id = request.json.get("id")
         if service_id is None:

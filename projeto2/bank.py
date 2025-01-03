@@ -32,17 +32,28 @@ last_learned_proposal = 0
 PRIVATE_KEY = ed448.Ed448PrivateKey.generate()
 PUBLIC_KEY = PRIVATE_KEY.public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo).decode('utf-8')
 
-def sign_message(message: str) -> str:
+public_key_cache = {}
+
+def sign_message_hmac(message: str) -> str:
     serialized_message = json.dumps(message, sort_keys=True).encode('utf-8')
     return hmac.new(SECRET_KEY, serialized_message, hashlib.sha384).hexdigest()
 
-def verify_message(message: str, signature: str):
-    expected_signature = sign_message(message)
+def verify_message_hmac(message: str, signature: str):
+    expected_signature = sign_message_hmac(message)
     return hmac.compare_digest(expected_signature, signature)
+
+def sign_message_ed448(message: str):
+    serialized_message = json.dumps(message, sort_keys=True).encode('utf-8')
+    return PRIVATE_KEY.sign(serialized_message).hex()
+
+def verify_message_ed448(message: str, signature: str, public_key: str):
+    serialized_message = json.dumps(message, sort_keys=True).encode('utf-8')
+    public_key = serialization.load_pem_public_key(public_key.encode('utf-8'))
+    public_key.verify(bytes.fromhex(signature), serialized_message)
 
 def register_service() -> None:
     payload = {"id": bank_id, "name": f"Bank of {continent}", "url": f"http://127.0.0.1:{PORT}/", "public_key": PUBLIC_KEY}
-    payload["signature"] = sign_message(str(payload))
+    payload["signature"] = sign_message_hmac(str(payload))
     try:
         response = requests.post(SERVICE_REGISTRY_URL, json=payload)
         response.raise_for_status()
@@ -51,14 +62,19 @@ def register_service() -> None:
         print(f"An error occurred registering service: {e}")
 
 def get_services() -> list:
+    global public_key_cache
     try:
         response = requests.get(SERVICE_REGISTRY_URL)
         response.raise_for_status()
         services = response.json()
 
-        # Convert dictionary of dictionaries to a list of dictionaries
         if isinstance(services, dict):
-            return [{"id": int(bank_id), **details} for bank_id, details in services.items()]
+            response = [{"id": int(bank_id), **details} for bank_id, details in services.items()]
+
+            for service in response:
+                public_key_cache[str(service["id"])] = service["public_key"]
+            
+            return response
 
         print("Unexpected response format:", services)
         return []
@@ -82,9 +98,11 @@ async def contact_service(service, payload, responses):
                 raise ValueError(f"Empty response from {service['name']} on port {target_port}")
             response = json.loads(response)
             signature = response.pop("signature", "")
-            if not verify_message(response, signature):
+            try:
+
+                verify_message_ed448(str(response), signature, service["public_key"])
+            except Exception as e:
                 raise ValueError(f"Invalid signature from {service['name']} on port {target_port}")
-            print(f"Response from {service['name']} (port {target_port}): {response}")
             responses.append(response)
     except (ConnectionError, ValueError, asyncio.TimeoutError, Exception) as e:
         print(f"Error communicating with {service['name']} on port {target_port}: {e}")
@@ -97,8 +115,8 @@ async def contact_service(service, payload, responses):
 
 
 async def send_paxos_message(phase, message) -> list:
-    payload = {"phase": phase, "data": message}
-    payload["signature"] = sign_message(payload)
+    payload = {"phase": phase, "data": message, "sender_id": bank_id}
+    payload["signature"] = sign_message_ed448(str(payload))
     services = get_services()
     responses = []
     node_id = message["node_id"]
@@ -117,7 +135,6 @@ async def send_paxos_message(phase, message) -> list:
 
 
 def majority_approved(responses, status_key="status", success_value="accepted"):
-    # Check if the majority of responses are successful
     successful = sum(1 for response in responses if response.get(status_key) == success_value)
     return successful >= (len(get_services()) - 1) // 2
 
@@ -217,25 +234,34 @@ async def process_message(client_socket, address):
         phase = message.get("phase")
         data = message.get("data")
 
-        if not verify_message(message, signature):
-            response = {"status": "error", "message": "Invalid signature"}
-        else:
-            response = None
+        sender_id = message.get("sender_id", None)
+        get_services()
+        sender_public_key = public_key_cache.get(str(sender_id))
 
-            if phase == "prepare":
-                response = handle_prepare(data)
-            elif phase == "accept":
-                handle_accept(data)
-            elif phase == "verify":
-                print("Handling verify message")
-                response = handle_verify(data)
-            elif phase == "learn":
-                handle_learn(data)
-            else:
-                response = {"status": "error", "message": "Invalid phase"}
+        if not sender_public_key:
+            raise ValueError(f"Public key for sender ID {sender_id} not found")
+        
+        try:
+            verify_message_ed448(str(message), signature, sender_public_key)
+        except Exception as e:
+            response = {"status": "error", "message": "Invalid signature"}
+
+        response = None
+
+        if phase == "prepare":
+            response = handle_prepare(data)
+        elif phase == "accept":
+            handle_accept(data)
+        elif phase == "verify":
+            response = handle_verify(data)
+        elif phase == "learn":
+            handle_learn(data)
+        else:
+            response = {"status": "error", "message": "Invalid phase"}
 
         if response:
-            response["signature"] = sign_message(response)
+            response["sender_id"] = bank_id
+            response["signature"] = sign_message_ed448(str(response))
             await asyncio.to_thread(client_socket.sendall, json.dumps(response).encode('utf-8'))
     except Exception as e:
         print(f"Error processing message from {address}: {e}")
