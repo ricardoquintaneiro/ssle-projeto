@@ -33,6 +33,20 @@ PRIVATE_KEY = ed448.Ed448PrivateKey.generate()
 PUBLIC_KEY = PRIVATE_KEY.public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo).decode('utf-8')
 
 public_key_cache = {}
+trust_scores = {}
+
+TRUST_INITIAL = 10
+TRUST_THRESHOLD = 8
+TRUST_PENALTY = 1
+TRUST_RECOVERY = 0.2
+
+def recover_trust(service_id):
+    service_id = str(service_id)
+    trust_scores[service_id] = min(TRUST_INITIAL, trust_scores[service_id] + TRUST_RECOVERY)
+
+def penalize_trust(service_id):
+    service_id = str(service_id)
+    trust_scores[service_id] = max(0, trust_scores[service_id] - TRUST_PENALTY)
 
 def sign_message_hmac(message: str) -> str:
     serialized_message = json.dumps(message, sort_keys=True).encode('utf-8')
@@ -62,18 +76,20 @@ def register_service() -> None:
         print(f"An error occurred registering service: {e}")
 
 def get_services() -> list:
-    global public_key_cache
+    global public_key_cache, trust_scores
     try:
         response = requests.get(SERVICE_REGISTRY_URL)
         response.raise_for_status()
         services = response.json()
 
         if isinstance(services, dict):
+            for service_id, details in services.items():
+                if trust_scores.get(str(service_id)) is None:
+                    trust_scores[str(service_id)] = TRUST_INITIAL
+                public_key_cache[str(service_id)] = details["public_key"]
+
             response = [{"id": int(bank_id), **details} for bank_id, details in services.items()]
 
-            for service in response:
-                public_key_cache[str(service["id"])] = service["public_key"]
-            
             return response
 
         print("Unexpected response format:", services)
@@ -84,29 +100,32 @@ def get_services() -> list:
 
 
 async def contact_service(service, payload, responses):
-    target_port = 6000 + service["id"]
+    service_id = service["id"]
+    target_port = 6000 + service_id
     try:
         reader, writer = await asyncio.open_connection('127.0.0.1', target_port)
         writer.write(json.dumps(payload).encode('utf-8'))
         await writer.drain()
 
         if payload["phase"] in ["prepare", "verify"]:
-            # Set a timeout for reading the response
             data = await asyncio.wait_for(reader.read(1024), timeout=5.0)
             response = data.decode('utf-8')
             if not response.strip():
                 raise ValueError(f"Empty response from {service['name']} on port {target_port}")
             response = json.loads(response)
             signature = response.pop("signature", "")
-            try:
 
+            try:
                 verify_message_ed448(str(response), signature, service["public_key"])
             except Exception as e:
                 raise ValueError(f"Invalid signature from {service['name']} on port {target_port}")
+
+            recover_trust(service_id)
             responses.append(response)
     except (ConnectionError, ValueError, asyncio.TimeoutError, Exception) as e:
         print(f"Error communicating with {service['name']} on port {target_port}: {e}")
         responses.append({"status": "error", "message": str(e)})
+        penalize_trust(service_id)
     finally:
         if 'writer' in locals():
             writer.close()
@@ -119,14 +138,15 @@ async def send_paxos_message(phase, message) -> list:
     payload["signature"] = sign_message_ed448(str(payload))
     services = get_services()
     responses = []
-    node_id = message["node_id"]
+
+    eligible_services = [service for service in services if trust_scores[str(service["id"])] >= TRUST_THRESHOLD]
 
     if phase == "verify":
-        targets = [service for service in services if service["id"] != node_id]
+        targets = [service for service in eligible_services if service["id"] != message["node_id"]]
     elif phase == "learn":
-        targets = services
+        targets = eligible_services
     else:
-        targets = [service for service in services if service["id"] != bank_id]
+        targets = [service for service in eligible_services if service["id"] != bank_id]
 
     tasks = [contact_service(service, payload, responses) for service in targets]
     await asyncio.gather(*tasks)
@@ -135,8 +155,9 @@ async def send_paxos_message(phase, message) -> list:
 
 
 def majority_approved(responses, status_key="status", success_value="accepted"):
+    eligible_services = len([service for service in get_services() if trust_scores[str(service["id"])] >= TRUST_THRESHOLD])
     successful = sum(1 for response in responses if response.get(status_key) == success_value)
-    return successful >= (len(get_services()) - 1) // 2
+    return successful >= (eligible_services // 2) + 1
 
 
 def handle_prepare(message):
@@ -161,22 +182,20 @@ def handle_accept(message):
     if incoming_proposal_id == proposal_id:
         accepted_proposal = proposed_account_balances
 
-        # Broadcast verify message asynchronously
         broadcast_message = {
             "proposal_id": proposal_id,
             "node_id": incoming_node_id,
             "account_balances": proposed_account_balances
         }
-        print("Broadcasting verify message:", broadcast_message)
 
-        # Dispatch the verify phase as a background task
         asyncio.create_task(verify_and_learn(broadcast_message))
+        recover_trust(incoming_node_id)
     else:
         print(f"Rejected proposal {incoming_proposal_id} (current: {proposal_id})")
+        penalize_trust(incoming_node_id)
 
 
 async def verify_and_learn(broadcast_message):
-    # Verify phase
     verification_responses = await send_paxos_message("verify", broadcast_message)
     print("Responses:", verification_responses)
 
@@ -184,7 +203,6 @@ async def verify_and_learn(broadcast_message):
         print(f"Verification failed for proposal {broadcast_message['proposal_id']}. Aborting Paxos.")
         return
 
-    # If majority verified, proceed to learn phase
     await send_paxos_message("learn", broadcast_message)
     print(f"Proposal {broadcast_message['proposal_id']} learned successfully.")
 
@@ -217,11 +235,18 @@ def handle_learn(message):
             learned_proposals[proposal_id] = 0
 
         learned_proposals[proposal_id] += 1
+        learned_count = learned_proposals[proposal_id]
 
-        if last_learned_proposal != proposal_id and learned_proposals[proposal_id] == ((len(get_services()) - 1) // 2) + 1:
-            account_balances.update(proposed_balances)
-            del learned_proposals[proposal_id]
-            last_learned_proposal = proposal_id
+    eligible_services = len([service for service in get_services() if trust_scores[str(service["id"])] >= TRUST_THRESHOLD])
+    majority_count = (eligible_services // 2) + 1
+
+    if learned_count >= majority_count:
+        with learned_proposals_lock:
+            if last_learned_proposal != proposal_id:
+                account_balances.update(proposed_balances)
+                del learned_proposals[proposal_id]
+                last_learned_proposal = proposal_id
+
 
 
 async def process_message(client_socket, address):
@@ -243,27 +268,32 @@ async def process_message(client_socket, address):
         
         try:
             verify_message_ed448(str(message), signature, sender_public_key)
+            response = None
+
+            if phase == "prepare":
+                response = handle_prepare(data)
+            elif phase == "accept":
+                handle_accept(data)
+            elif phase == "verify":
+                response = handle_verify(data)
+            elif phase == "learn":
+                handle_learn(data)
+            else:
+                response = {"status": "error", "message": "Invalid phase"}
+                penalize_trust(sender_id)
+
+            if response:
+                if response.get("status") != "error":
+                    recover_trust(sender_id)
+                response["sender_id"] = bank_id
+                response["signature"] = sign_message_ed448(str(response))
+                await asyncio.to_thread(client_socket.sendall, json.dumps(response).encode('utf-8'))
         except Exception as e:
-            response = {"status": "error", "message": "Invalid signature"}
+            raise ValueError(f"Invalid signature: {e}")
 
-        response = None
-
-        if phase == "prepare":
-            response = handle_prepare(data)
-        elif phase == "accept":
-            handle_accept(data)
-        elif phase == "verify":
-            response = handle_verify(data)
-        elif phase == "learn":
-            handle_learn(data)
-        else:
-            response = {"status": "error", "message": "Invalid phase"}
-
-        if response:
-            response["sender_id"] = bank_id
-            response["signature"] = sign_message_ed448(str(response))
-            await asyncio.to_thread(client_socket.sendall, json.dumps(response).encode('utf-8'))
     except Exception as e:
+        if message.get("sender_id") is not None:
+            penalize_trust(message["sender_id"])
         print(f"Error processing message from {address}: {e}")
     finally:
         client_socket.close()
