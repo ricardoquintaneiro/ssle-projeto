@@ -8,6 +8,8 @@ import threading
 from threading import Lock
 
 import requests
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed448
 from flask import Flask, request
 from flask_restful import Api, Resource
 
@@ -27,6 +29,9 @@ accepted_proposal = None
 learned_proposals = {}
 last_learned_proposal = 0
 
+PRIVATE_KEY = ed448.Ed448PrivateKey.generate()
+PUBLIC_KEY = PRIVATE_KEY.public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo).decode('utf-8')
+
 def sign_message(message: str) -> str:
     serialized_message = json.dumps(message, sort_keys=True).encode('utf-8')
     return hmac.new(SECRET_KEY, serialized_message, hashlib.sha384).hexdigest()
@@ -36,7 +41,8 @@ def verify_message(message: str, signature: str):
     return hmac.compare_digest(expected_signature, signature)
 
 def register_service() -> None:
-    payload = {"id": bank_id, "name": f"Bank of {continent}", "url": f"http://127.0.0.1:{PORT}/"}
+    payload = {"id": bank_id, "name": f"Bank of {continent}", "url": f"http://127.0.0.1:{PORT}/", "public_key": PUBLIC_KEY}
+    payload["signature"] = sign_message(str(payload))
     try:
         response = requests.post(SERVICE_REGISTRY_URL, json=payload)
         response.raise_for_status()
