@@ -199,6 +199,10 @@ async def verify_and_learn(broadcast_message):
     verification_responses = await send_paxos_message("verify", broadcast_message)
     print("Responses:", verification_responses)
 
+    for response in verification_responses:
+        if response.get("status") is None or response.get("status") != "verified":
+            penalize_trust(response["sender_id"])
+
     if not majority_approved(verification_responses, "status", "verified"):
         print(f"Verification failed for proposal {broadcast_message['proposal_id']}. Aborting Paxos.")
         return
@@ -207,19 +211,15 @@ async def verify_and_learn(broadcast_message):
     print(f"Proposal {broadcast_message['proposal_id']} learned successfully.")
 
 
-
-
 def handle_verify(message):
     global proposal_id, accepted_proposal
 
     incoming_proposal_id = message["proposal_id"]
     proposed_account_balances = message["account_balances"]
 
-    # Check proposal ID and balances
     if incoming_proposal_id == proposal_id and proposed_account_balances == accepted_proposal:
         return {"status": "verified"}
     return {"status": "error", "message": "Mismatch in proposal or balances"}
-
 
 
 learned_proposals_lock = Lock()
@@ -285,6 +285,8 @@ async def process_message(client_socket, address):
             if response:
                 if response.get("status") != "error":
                     recover_trust(sender_id)
+                else:
+                    penalize_trust(sender_id)
                 response["sender_id"] = bank_id
                 response["signature"] = sign_message_ed448(str(response))
                 await asyncio.to_thread(client_socket.sendall, json.dumps(response).encode('utf-8'))
@@ -314,7 +316,7 @@ async def consume_paxos_messages():
 async def wait_for_majority_learn(proposal_id):
     global learned_proposals, last_learned_proposal
 
-    timeout = 10  # Adjust as needed
+    timeout = 10
     start_time = asyncio.get_event_loop().time()
 
     while asyncio.get_event_loop().time() - start_time < timeout:
@@ -341,7 +343,6 @@ class Bank(Resource):
         source = request.json.get("source")
         destination = request.json.get("destination")
 
-        # Validate action
         if action not in ["withdraw", "deposit", "transfer"]:
             return {"status": "error", "message": "Invalid action"}, 400
 
@@ -355,7 +356,6 @@ class Bank(Resource):
             if amount > account_balances[source]:
                 return {"status": "error", "message": "Insufficient funds in source account"}, 400
 
-            # Compute new balances
             new_account_balances = account_balances.copy()
             new_account_balances[source] -= amount
             new_account_balances[destination] += amount
@@ -374,18 +374,14 @@ class Bank(Resource):
             elif action == "deposit":
                 new_account_balances[source] += amount
 
-        # Increment proposal ID for Paxos
         proposal_id += 1
 
-        # Paxos Phase 1: Prepare
         prepare_responses = asyncio.run(send_paxos_message("prepare", {"proposal_id": proposal_id, "node_id": bank_id, "account_balances": new_account_balances}))
         if not majority_approved(prepare_responses, "status", "promise"):
             return {"message": "Operation rejected during prepare phase"}, 400
 
-        # Paxos Phase 2: Accept
         asyncio.run(send_paxos_message("accept", {"proposal_id": proposal_id, "node_id": bank_id, "account_balances": new_account_balances}))
 
-        # Wait until learning phase completes
         learning_completed = asyncio.run(wait_for_majority_learn(proposal_id))
 
         if not learning_completed:
